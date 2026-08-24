@@ -8,7 +8,6 @@ import types
 import json
 import traceback
 import urllib.parse
-import mimetypes
 from pathlib import Path
 
 from datetime import datetime
@@ -19,7 +18,7 @@ from typing import Any, Dict, List, Optional, TypeVar, Union, Callable, Type
 from .constants import Constants, Results, ServerCommands, Errors, Ports, HostPrograms, ServerEvents
 from .modules import core
 from .logger import Logger
-from .responses import HtmlResponse
+from .responses import HtmlResponse, RawGetResponse
 
 logger = Logger()
 
@@ -200,13 +199,13 @@ class Server:
             echo_response: bool = True,
             only_allow_localhost_connections: bool = True,
             html_origin_allowlist_provider: Optional[Callable[[], List[str]]] = None,
-            static_dir: Optional[Union[str, Path]] = None,
+            raw_get_handler: Optional[Callable[[str], Optional[RawGetResponse]]] = None,
     ) -> None:
 
         self.events: EventEmitter = EventEmitter()
         self.executor_reply: Optional[Dict[str, Any]] = None
         self.html_origin_allowlist_provider: Optional[Callable[[], List[str]]] = html_origin_allowlist_provider
-        self.static_dir: Optional[Path] = Path(static_dir) if static_dir is not None else None
+        self.raw_get_handler: Optional[Callable[[str], Optional[RawGetResponse]]] = raw_get_handler
 
         if port:
             self.port: int = port
@@ -553,7 +552,19 @@ class SkyHookHTTPRequestHandler(BaseHTTPRequestHandler):
         try:
             function: str = eval(parts[0])
             parameters: Dict[str, Any] = json.loads(parts[1])
-        except NameError as err:
+        except (NameError, SyntaxError, ValueError, IndexError) as err:
+            # This GET is not a function-call dispatch. Dispatch stays the primary
+            # path; only on a parse miss do we offer the request to the app's
+            # optional raw GET handler (e.g. static-file serving).
+            if self.skyhook_server.raw_get_handler is not None:
+                raw: Optional[RawGetResponse] = self.skyhook_server.raw_get_handler(self.path)
+                if raw is not None:
+                    self.send_response(raw.status)
+                    self.send_header("Content-type", raw.content_type)
+                    self.end_headers()
+                    if raw.body:
+                        self.wfile.write(raw.body)
+                    return
             logger.warning(f"Got a GET request that I don't know what to do with")
             logger.warning(f"Request was: GET {data}")
             logger.warning(f"Error is   : {err}")
@@ -572,7 +583,7 @@ class SkyHookHTTPRequestHandler(BaseHTTPRequestHandler):
                     self.send_header('Content-type', 'text/html; charset=utf-8')
                     self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
-                    self.wfile.write(b"<html><body><h1>403 Forbidden</h1><p>Origin not in allowlist. Add your Swarm URL to skyhooklinks settings.</p></body></html>")
+                    self.wfile.write(b"<html><body><h1>403 Forbidden</h1><p>Origin not in allowlist.</p></body></html>")
                     return
 
         command_response: Union[bytes, HtmlResponse] = self.skyhook_server.filter_and_execute_function(function, parameters)
